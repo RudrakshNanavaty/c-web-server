@@ -9,6 +9,8 @@ project(
 dependencies = [
 ]
 
+inc = include_directories('include')
+
 sources = [
   'src/main.c',
   'src/server.c',
@@ -18,6 +20,7 @@ sources = [
 exe = executable(
   'web-server',
   sources,
+  include_directories : inc,
   dependencies : dependencies,
   install : true,
 )
