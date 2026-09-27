@@ -1,0 +1,28 @@
+# Meson / Ninja build
+/build/
+/builddir/
+/out/
+
+# Compiled objects and binaries
+*.o
+*.a
+*.so
+*.dylib
+*.exe
+*.out
+
+# Clangd / editor tooling
+.cache/
+compile_commands.json
+
+# IDE / editor
+.cursor/
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db

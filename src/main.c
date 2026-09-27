@@ -14,6 +14,11 @@ int main(
 
 	char *port = (argc == 2) ? argv[1] : "8080";
 
+	// Print the program name.
+	printf("\n========================================\n");
+	printf("Starting server...\n");
+	printf("========================================\n");
+
 	run_server(port);
 
 	return 0;

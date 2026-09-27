@@ -12,6 +12,7 @@ dependencies = [
 sources = [
   'src/main.c',
   'src/server.c',
+  'src/http.c',
 ]
 
 exe = executable(
