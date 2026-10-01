@@ -5,11 +5,99 @@
 #include <string.h>
 #include <sys/socket.h>
 
+static int ascii_tolower(unsigned char c) {
+	if (c >= 'A' && c <= 'Z') {
+		return c - 'A' + 'a';
+	}
+	return c;
+}
+
+static int ascii_strncasecmp(const char *a, const char *b, size_t n) {
+	for (size_t i = 0; i < n; i++) {
+		int ca = ascii_tolower((unsigned char)a[i]);
+		int cb = ascii_tolower((unsigned char)b[i]);
+		if (ca != cb) {
+			return ca - cb;
+		}
+		if (a[i] == '\0') {
+			return 0;
+		}
+	}
+	return 0;
+}
+
+// Token match inside a comma-separated Connection value (case-insensitive).
+static int connection_has_token(const char *value, const char *token) {
+	size_t token_len = strlen(token);
+	const char *cursor = value;
+	while (*cursor != '\0') {
+		while (*cursor == ' ' || *cursor == '\t' || *cursor == ',') {
+			cursor++;
+		}
+		if (*cursor == '\0') {
+			break;
+		}
+		const char *start = cursor;
+		while (*cursor != '\0' && *cursor != ',' && *cursor != ' ' &&
+			   *cursor != '\t' && *cursor != '\r' && *cursor != '\n') {
+			cursor++;
+		}
+		size_t len = (size_t)(cursor - start);
+		if (len == token_len && ascii_strncasecmp(start, token, token_len) == 0) {
+			return 1;
+		}
+	}
+	return 0;
+}
+
+// Find Connection header value; returns NULL when absent.
+static const char *find_connection_header(const char *raw) {
+	const char *line = raw;
+	while (*line != '\0') {
+		const char *next = strstr(line, "\r\n");
+		if (next == NULL) {
+			break;
+		}
+		if (next == line) {
+			break; // End of headers
+		}
+		size_t line_len = (size_t)(next - line);
+		if (line_len >= 11 && ascii_strncasecmp(line, "Connection:", 11) == 0) {
+			const char *value = line + 11;
+			while (*value == ' ' || *value == '\t') {
+				value++;
+			}
+			return value;
+		}
+		line = next + 2;
+	}
+	return NULL;
+}
+
+static int decide_close_connection(const char *raw, const char *version) {
+	const char *connection = find_connection_header(raw);
+	if (connection != NULL) {
+		if (connection_has_token(connection, "close")) {
+			return 1;
+		}
+		if (connection_has_token(connection, "keep-alive")) {
+			return 0;
+		}
+	}
+	// HTTP/1.1 defaults to keep-alive; HTTP/1.0 and earlier default to close.
+	if (strcmp(version, "HTTP/1.1") == 0) {
+		return 0;
+	}
+	return 1;
+}
+
 // Parse the request line (METHOD PATH VERSION) from a raw HTTP request.
 int http_parse_request(const char *raw, HttpRequest *req) {
 	if (raw == NULL || req == NULL) {
 		return -1;
 	}
+
+	req->close_connection = 1;
 
 	// Request line is everything before the first '\r' or '\n'.
 	// Example: "GET /index.html HTTP/1.1"
@@ -38,6 +126,7 @@ int http_parse_request(const char *raw, HttpRequest *req) {
 		return -1;
 	}
 
+	req->close_connection = decide_close_connection(raw, req->version);
 	return 0;
 }
 
@@ -347,7 +436,7 @@ int http_send_all(int fd, const void *buf, size_t len) {
 
 int http_send_headers(
 	int fd, int status, const char *reason, const char *content_type,
-	unsigned long long content_length, const char *extra_headers
+	unsigned long long content_length, const char *extra_headers, int keep_alive
 ) {
 	char header[1024];
 	if (reason == NULL || reason[0] == '\0') {
@@ -361,19 +450,21 @@ int http_send_headers(
 		extra_headers = "";
 	}
 
+	const char *connection = keep_alive ? "keep-alive" : "close";
 	int written = snprintf(
 		header,
 		sizeof header,
 		"HTTP/1.1 %d %s\r\n"
 		"Content-Length: %llu\r\n"
 		"Content-Type: %s\r\n"
-		"Connection: close\r\n"
+		"Connection: %s\r\n"
 		"%s"
 		"\r\n",
 		status,
 		reason,
 		content_length,
 		content_type,
+		connection,
 		extra_headers
 	);
 	if (written < 0 || (size_t)written >= sizeof header) {

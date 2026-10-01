@@ -5,6 +5,7 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <netdb.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -12,14 +13,23 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/time.h>
 #include <unistd.h>
 
 #define BACKLOG 10
 #define STATIC_ROOT "static"
 #define FILE_CHUNK_SIZE 8192
+#define KEEP_ALIVE_TIMEOUT_SEC 15
+#define KEEP_ALIVE_MAX_REQUESTS 100
+
+typedef struct {
+	int client_socket;
+	char static_root[PATH_MAX];
+} ClientArgs;
 
 static int send_text_status(
-	int client_socket, int status, const char *reason, const char *extra_headers
+	int client_socket, int status, const char *reason,
+	const char *extra_headers, int keep_alive
 ) {
 	char body[128];
 	int written = snprintf(body, sizeof body, "%d %s\n", status, reason);
@@ -33,7 +43,8 @@ static int send_text_status(
 			reason,
 			"text/plain; charset=utf-8",
 			(unsigned long long)written,
-			extra_headers
+			extra_headers,
+			keep_alive
 		) == -1) {
 		return -1;
 	}
@@ -107,7 +118,7 @@ static int resolve_static_file(
 	return 0;
 }
 
-static int send_file(int client_socket, const char *path) {
+static int send_file(int client_socket, const char *path, int keep_alive) {
 	int file = open(path, O_RDONLY | O_CLOEXEC);
 	if (file == -1) {
 		return -1;
@@ -128,7 +139,8 @@ static int send_file(int client_socket, const char *path) {
 			"OK",
 			http_mime_type(path),
 			(unsigned long long)info.st_size,
-			NULL
+			NULL,
+			keep_alive
 		) == -1) {
 		close(file);
 		return -1;
@@ -167,87 +179,146 @@ static int send_file(int client_socket, const char *path) {
 }
 
 static void handle_client(int client_socket, const char *static_root) {
-	char buffer[HTTP_HEADER_MAX + 1];
-	int read_status = http_read_headers(client_socket, buffer, sizeof buffer);
-	if (read_status == HTTP_READ_CLOSED) {
-		close(client_socket);
-		return;
-	}
-	if (read_status == HTTP_READ_ERROR) {
-		perror("server: recv");
-		close(client_socket);
-		return;
-	}
-	if (read_status == HTTP_READ_TOO_LARGE) {
-		send_text_status(
+	struct timeval timeout = {
+		.tv_sec = KEEP_ALIVE_TIMEOUT_SEC,
+		.tv_usec = 0,
+	};
+	if (setsockopt(
 			client_socket,
-			431,
-			"Request Header Fields Too Large",
-			NULL
-		);
-		close(client_socket);
-		return;
-	}
-	if (read_status == HTTP_READ_INCOMPLETE) {
-		send_text_status(client_socket, 400, "Bad Request", NULL);
-		close(client_socket);
-		return;
-	}
-
-	HttpRequest request;
-	if (http_parse_request(buffer, &request) == -1) {
-		send_text_status(client_socket, 400, "Bad Request", NULL);
-		close(client_socket);
-		return;
-	}
-
-	printf(
-		"Parsed: method=%s path=%s version=%s\n",
-		request.method,
-		request.path,
-		request.version
-	);
-
-	if (strcmp(request.method, "GET") != 0) {
-		send_text_status(
-			client_socket,
-			405,
-			"Method Not Allowed",
-			"Allow: GET\r\n"
-		);
-		close(client_socket);
-		return;
-	}
-
-	char mapped[PATH_MAX];
-	if (http_map_static_path(
-			request.path,
-			static_root,
-			mapped,
-			sizeof mapped
+			SOL_SOCKET,
+			SO_RCVTIMEO,
+			&timeout,
+			sizeof timeout
 		) == -1) {
-		send_text_status(client_socket, 400, "Bad Request", NULL);
+		perror("server: setsockopt");
 		close(client_socket);
 		return;
 	}
 
-	char resolved[PATH_MAX];
-	if (resolve_static_file(static_root, mapped, resolved, sizeof resolved) ==
-		-1) {
-		if (not_found_error(errno)) {
-			send_text_status(client_socket, 404, "Not Found", NULL);
-		} else {
-			perror("server: file");
-			send_text_status(client_socket, 500, "Internal Server Error", NULL);
+	int requests = 0;
+	while (requests < KEEP_ALIVE_MAX_REQUESTS) {
+		char buffer[HTTP_HEADER_MAX + 1];
+		int read_status =
+			http_read_headers(client_socket, buffer, sizeof buffer);
+		if (read_status == HTTP_READ_CLOSED) {
+			break;
 		}
-		close(client_socket);
-		return;
+		if (read_status == HTTP_READ_ERROR) {
+			// Idle keep-alive timeout or other recv failure - just close.
+			if (errno != EAGAIN && errno != EWOULDBLOCK && errno != ETIMEDOUT) {
+				perror("server: recv");
+			}
+			break;
+		}
+		if (read_status == HTTP_READ_TOO_LARGE) {
+			send_text_status(
+				client_socket,
+				431,
+				"Request Header Fields Too Large",
+				NULL,
+				0
+			);
+			break;
+		}
+		if (read_status == HTTP_READ_INCOMPLETE) {
+			send_text_status(client_socket, 400, "Bad Request", NULL, 0);
+			break;
+		}
+
+		HttpRequest request;
+		if (http_parse_request(buffer, &request) == -1) {
+			send_text_status(client_socket, 400, "Bad Request", NULL, 0);
+			break;
+		}
+
+		requests++;
+		int keep_alive = !request.close_connection &&
+						 requests < KEEP_ALIVE_MAX_REQUESTS;
+
+		printf(
+			"Parsed: method=%s path=%s version=%s keep_alive=%d\n",
+			request.method,
+			request.path,
+			request.version,
+			keep_alive
+		);
+
+		if (strcmp(request.method, "GET") != 0) {
+			send_text_status(
+				client_socket,
+				405,
+				"Method Not Allowed",
+				"Allow: GET\r\n",
+				keep_alive
+			);
+			if (!keep_alive) {
+				break;
+			}
+			continue;
+		}
+
+		char mapped[PATH_MAX];
+		if (http_map_static_path(
+				request.path,
+				static_root,
+				mapped,
+				sizeof mapped
+			) == -1) {
+			send_text_status(client_socket, 400, "Bad Request", NULL, keep_alive);
+			if (!keep_alive) {
+				break;
+			}
+			continue;
+		}
+
+		char resolved[PATH_MAX];
+		if (resolve_static_file(
+				static_root,
+				mapped,
+				resolved,
+				sizeof resolved
+			) == -1) {
+			if (not_found_error(errno)) {
+				send_text_status(
+					client_socket,
+					404,
+					"Not Found",
+					NULL,
+					keep_alive
+				);
+			} else {
+				perror("server: file");
+				send_text_status(
+					client_socket,
+					500,
+					"Internal Server Error",
+					NULL,
+					keep_alive
+				);
+			}
+			if (!keep_alive) {
+				break;
+			}
+			continue;
+		}
+
+		if (send_file(client_socket, resolved, keep_alive) == -1) {
+			perror("server: send");
+			break;
+		}
+		if (!keep_alive) {
+			break;
+		}
 	}
 
-	if (send_file(client_socket, resolved) == -1) {
-		perror("server: send");
-	}
 	close(client_socket);
+}
+
+static void *client_thread(void *arg) {
+	ClientArgs *args = arg;
+	handle_client(args->client_socket, args->static_root);
+	free(args);
+	return NULL;
 }
 
 void run_server(const char *port) {
@@ -364,7 +435,25 @@ void run_server(const char *port) {
 			continue;
 		}
 
-		handle_client(client_socket, static_root);
+		ClientArgs *args = malloc(sizeof *args);
+		if (args == NULL) {
+			perror("server: malloc");
+			close(client_socket);
+			continue;
+		}
+		args->client_socket = client_socket;
+		memcpy(args->static_root, static_root, sizeof args->static_root);
+
+		pthread_t thread;
+		int create_status = pthread_create(&thread, NULL, client_thread, args);
+		if (create_status != 0) {
+			errno = create_status;
+			perror("server: pthread_create");
+			close(client_socket);
+			free(args);
+			continue;
+		}
+		pthread_detach(thread);
 	}
 
 	close(http_socket);

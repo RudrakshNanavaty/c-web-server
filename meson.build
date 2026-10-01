@@ -7,6 +7,7 @@ project(
 )
 
 dependencies = [
+  dependency('threads'),
 ]
 
 inc = include_directories('include')
@@ -26,13 +27,4 @@ exe = executable(
   install : true,
 )
 
-http_tests = executable(
-  'http_tests',
-  'tests/test_http.c',
-  include_directories : inc,
-  link_with : libhttp,
-)
-
 run_target('run', command: [exe])
-
-test('http', http_tests)

@@ -20,9 +20,11 @@ typedef struct {
 	char method[16];
 	char path[HTTP_PATH_MAX];
 	char version[16];
+	/* Non-zero when the response should close the connection afterward. */
+	int close_connection;
 } HttpRequest;
 
-// Parse the request line (METHOD PATH VERSION) from a raw HTTP request.
+// Parse the request line (METHOD PATH VERSION) and Connection policy.
 // Returns 0 on success, -1 on failure.
 int http_parse_request(const char *raw, HttpRequest *req);
 
@@ -48,11 +50,12 @@ int http_read_headers(int fd, char *buf, size_t capacity);
 // Returns 0 on success, -1 on disconnect or error.
 int http_send_all(int fd, const void *buf, size_t len);
 
+// keep_alive non-zero emits Connection: keep-alive; otherwise Connection: close.
 // extra_headers is NULL or a list of lines that each end in CRLF.
 // Returns 0 on success, -1 on error.
 int http_send_headers(
 	int fd, int status, const char *reason, const char *content_type,
-	unsigned long long content_length, const char *extra_headers
+	unsigned long long content_length, const char *extra_headers, int keep_alive
 );
 
 #endif
