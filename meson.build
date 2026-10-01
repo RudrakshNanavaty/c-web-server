@@ -11,20 +11,28 @@ dependencies = [
 
 inc = include_directories('include')
 
-sources = [
-  'src/main.c',
-  'src/server.c',
+libhttp = static_library(
+  'http',
   'src/http.c',
-]
+  include_directories : inc,
+)
 
 exe = executable(
   'web-server',
-  sources,
+  ['src/main.c', 'src/server.c'],
   include_directories : inc,
   dependencies : dependencies,
+  link_with : libhttp,
   install : true,
+)
+
+http_tests = executable(
+  'http_tests',
+  'tests/test_http.c',
+  include_directories : inc,
+  link_with : libhttp,
 )
 
 run_target('run', command: [exe])
 
-test('basic', exe)
+test('http', http_tests)
